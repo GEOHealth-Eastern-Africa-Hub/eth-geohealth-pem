@@ -242,7 +242,7 @@ df_final_GPS <- GPS_data |>
 colnames(df_final_GPS) <- c("TimeStamp", "X__m/s2", "Y__m/s2", "Z__m/s2", "RSSxyz__m/s2", "SD_RSS__m/s2", "Movement","average_movement", "worn", "original_latitude", "original_longitude", "Height__m", "MSL__m", "hdop__m", "vdop__m")
 
 #### Clean latitude and longitude based on HDOP
-# if HDOP value is >20 or < 0, change it to NULL
+# if HDOP value is > 20 or < 0, change it to NULL
 df_final_GPS$cleaned_latitude <- ifelse(df_final_GPS$hdop__m > 20 | df_final_GPS$hdop__m < 1, NA, df_final_GPS$original_latitude)
 df_final_GPS$cleaned_longitude <- ifelse(df_final_GPS$hdop__m > 20 | df_final_GPS$hdop__m < 1, NA, df_final_GPS$original_longitude)
 
