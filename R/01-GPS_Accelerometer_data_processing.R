@@ -40,11 +40,11 @@ library(htmlwidgets)
 #### Set Working Directory #### -----------------------------------------------
 ## Set the working directory to your folder containing the files. You can set WD manually by clicking session>set working directory>set directory
 ## Example: setwd("/path/to/your/data/folder")
-setwd("C:/Users/Getu Gari/Desktop/eth-geohealth-pem/inputs/GCDCData XB-89e6")
 
 #### Import GPS data #### -----------------------------------------------------
 # List all files in the folder and filter for filenames starting with 'DATA':
-file_list <- list.files(pattern = "DATA", full.names = TRUE)
+file_list <- list.files(path = "inputs/GCDCData XB-89e6",
+                        pattern = "DATA", recursive = TRUE, full.names = TRUE)
 
 # Define column names for GPS data
 column_names <- c("Time", "Ax", "Ay", "Az", "P", "T", "TOW", "Lat", "Lon", "Height(m)", "MSL(m)", "hdop(m)", "vdop(m)")
@@ -62,7 +62,7 @@ summary(GPS_data)
 
 #### Extract Serial Number and Start Date from Header ####
 # we want to use serial number and start time to name the exported files for this code
-first_file = substr(file_list[1], 3, nchar(file_list[1]))
+first_file = substr(file_list[1], 1, nchar(file_list[1]))
 # Process the header lines to extract Start_time
 header_lines <- readLines(first_file)
 # Loop through the header lines to find the Start_time information
@@ -77,7 +77,7 @@ print(paste("Start Time:", start_time))
 
 #### Function to Sanitize File Names ####
 sanitize_filename <- function(filename) {
-  # Replace colons, commas, and spaces with underscores
+# Replace colons, commas, and spaces with underscores
   filename <- gsub(":", "_", filename)  # Replace colons
   filename <- gsub(",", "_", filename)  # Replace commas
   filename <- gsub(" ", "_", filename)  # Replace spaces
