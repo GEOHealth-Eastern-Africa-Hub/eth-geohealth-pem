@@ -1,0 +1,412 @@
+---
+title: "Accelerometer, GPS, and Atmotube Data Summary"
+author: "Getu GARI"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    df-print: paged
+---
+
+::: {.callout-note title = "Instructions before you begin"}
+- Ensure GPS and Atmotube data are in the **same folder**.
+- GPS filenames should start with `DATA`.
+- Update Atmotube file path manually (see code section "Load and Format Atmotube Data").
+- Adjust timezone if different from Nairobi (`tz = "Africa/Nairobi"`).
+:::
+
+```{r setup, include = FALSE}
+# Load required packages and set chunk options
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+
+library(tidyverse)
+library(readr)
+library(lubridate)
+library(zoo)
+library(htmlwidgets)
+library(plotly)
+library(leaflet)
+```
+
+## Import GPS Data
+
+This section loads and processes all GPS data files with filenames starting with DATA into a single dataframe for further analysis.
+
+```{r import-gps-data}
+# Set the working directory containing GPS files
+setwd("../inputs/PEM_Household_25-30/E1201005005_MM_19_Feb_2025/GCDC5F8B_EC1201005005_Zerubabel_MM_19_Feb_2025")
+
+# Import all files starting with 'DATA' and combine them
+file_list <- list.files(pattern = "DATA", full.names = TRUE)
+column_names <- c("Time", "Ax", "Ay", "Az", "P", "T", "TOW", "Lat","Lon", "Height(m)", "MSL(m)", "hdop(m)", "vdop(m)")
+
+GPS_data <- data.frame()
+for (file_path in file_list) {
+  data <- read.csv(file_path, comment.char = ";", header = FALSE, col.names = column_names)
+  GPS_data <- bind_rows(GPS_data, data)
+}
+
+summary(GPS_data)
+```
+
+## Extract Serial Number and Start Time
+
+This step extracts important metadata from the first GPS data file, including the serial number and start time of the device.
+
+```{r header-info}
+# Define the correct file path
+first_file_path <- "../inputs/PEM_Household_25-30/E1201005005_MM_19_Feb_2025/GCDC5F8B_EC1201005005_Zerubabel_MM_19_Feb_2025/DATA-001.CSV"
+
+# Extract Serial Number and Start Time from the first DATA file header
+first_file = substr(first_file_path[1], 3, nchar(first_file_path[1]))
+header_lines <- readLines(first_file_path)
+
+for (line in header_lines) {
+  if (grepl(";Start_time,", line)) {
+    start_time <- gsub("^.*;Start_time,\\s*", "", line)
+    start_time <- gsub(":|,", "_", start_time)
+    start_time <- gsub("\\s+", "", start_time)
+    break
+  }
+}
+
+print(paste("Start Time:", start_time))
+
+for (line in header_lines) {
+  if (grepl("SN:", line)) {
+    SN <- gsub("^.*;SN,\\s*", "", line)
+    break
+  }
+}
+
+SN <- substr(SN, nchar(SN) - 3, nchar(SN))
+print(paste("Serial Number:", SN))
+```
+
+## Convert Timestamps and Compute RSS
+
+This step converts the GPS timestamps into a proper/readble POSIX datetime format and calculates the Root Sum Square (RSS) for accelerometer data. RSS is used to represent the movement intensity.
+
+```{r process-time-rss}
+# Convert time column from seconds since epoch to POSIX datetime
+GPS_data$Time <- as.numeric(GPS_data$Time)
+GPS_data$Time <- as_datetime("1970-01-01 00:00:00") + GPS_data$Time
+#GPS_data$Time <- with_tz(GPS_data$Time, tz = "GMT")
+
+GPS_data$RSSxyz <- sqrt(GPS_data$Ax^2 + GPS_data$Ay^2 + GPS_data$Az^2)
+```
+
+### Plot RSS over time
+
+The plot below shows/visualizes the variation in the RSS (Root Sum of Square) values over time, indicating accelerometer movement patterns.
+
+```{r plot-rss, fig.width = 10, fig.height = 4}
+plotRRS <- GPS_data %>%
+  ggplot(aes(x = Time, y = RSSxyz)) +
+  geom_line(color = 'blue') +
+  ggtitle("RSS with default frequency") +
+  theme(axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14))
+
+print(plotRRS)
+```
+
+```{r save-rss-html, eval=FALSE}
+# saveWidget(ggplotly(plotRRS), file = paste0(SN, "_RSS_of_X_Y_Z_at_default_frequency.html"))
+```
+
+## Minute-Level Summary and Movement Detection
+## Aggregation and SD
+
+This section performs data aggregation to compute minute-level statistics for movement detection, based on standard deviation (SD).
+
+```{r sd-minute}
+# Aggregate data to the minute level and calculate mean + SD
+GPS_data <- GPS_data %>%
+  mutate(datetime_minute = floor_date(Time, unit = "minute")) %>%
+  group_by(datetime_minute) %>%
+  summarize_all(.funs = list(mean, sd), na.rm = TRUE)
+
+# Rename SD column of RSS
+names(GPS_data)[names(GPS_data) == "RSSxyz_fn2"] <- "SD_of_RSS"
+```
+
+### Plot SD of RSS
+
+The plot below shows the standard deviation (SD) of RSS over time, which helps in identifying variations in movement.
+
+```{r plot-sd-rss, fig.width = 10, fig.height = 4}
+# Standard Deviation of RSS (m/s²) per Minute
+plotSD_min <- GPS_data %>%
+  ggplot(aes(x = datetime_minute, y = SD_of_RSS)) +
+  geom_line(color='blue') +
+  ggtitle("SD of RSS with minute frequency") +
+  #ggtitle("Standard Deviation of RSS (m/s²) per Minute") +
+  theme(axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14))
+
+print(plotSD_min)
+```
+
+```{r save-sd-html, eval=FALSE}
+# saveWidget(ggplotly(plotSD_min), file = paste0(SN, "_SD_of_RSS.html"))
+```
+
+## Movement Threshold
+
+This section flags periods of high movement based on a threshold of SD and calculates an average movement over time.
+
+```{r movement}
+# Flag high movement using SD threshold
+threshold <- 50
+print(paste("Threshold:", threshold))
+
+# Compute rolling average movement over a 10-minute window
+GPS_data$movement <- ifelse(GPS_data$SD_of_RSS > threshold, 1, 0)
+GPS_data$average_movement <- rollapply(GPS_data$movement, width = 10, FUN = mean, align = "right", fill = NA)
+```
+
+### Plot Movement
+
+This plot visualizes the detected movement based on the computed SD threshold.
+
+```{r plot-movement, fig.width = 10, fig.height = 3}
+plot_movement <- GPS_data %>%
+  ggplot(aes(x = datetime_minute, y = movement)) +
+  geom_line(color = 'blue') +
+  ggtitle("MOVEMENT") +
+  theme(axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14))
+
+print(plot_movement)
+```
+
+### Plot Average Movement
+
+This plot represents the average movement over a 10-minute rolling window.
+
+```{r plot-avg-movement, fig.width = 10, fig.height = 3}
+plot_avg_movement <- GPS_data %>%
+  ggplot(aes(x = datetime_minute, y = average_movement)) +
+  geom_line(color = 'blue') +
+  ggtitle("AVERAGE MOVEMENT") +
+  theme(axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14))
+
+print(plot_avg_movement)
+```
+
+## Worn Indicator and Daily Summary
+
+Here we define the device as "worn" if the average movement is above 0 and summarize usage by day.
+
+```{r worn-daily}
+# Define device worn status and summarize daily
+# Consider the device as "worn" if average movement is detected
+GPS_data$worn <- ifelse(GPS_data$average_movement > 0, 1, 0)
+
+# Create day intervals
+GPS_data <- GPS_data %>%
+  mutate(day_interval = ceiling(as.numeric(datetime_minute - datetime_minute[1]) / 86400))
+
+# Summarize daily device use
+df_day <- GPS_data %>%
+  group_by(day_interval) %>%
+  summarize(Hours_worn = sum(worn, na.rm = TRUE)/60,
+            Total_deployment_hours = sum(day_interval, na.rm = TRUE)/60)
+
+print(df_day)
+```
+
+### Plot Worn
+
+This plot shows when the device was worn during the time series.
+
+```{r plot-worn, fig.width = 10, fig.height = 3}
+worn_plot <- GPS_data %>%
+  ggplot(aes(x = datetime_minute, y = worn)) +
+  geom_line(color = 'blue') +
+  ggtitle("WORN") +
+  theme(axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14))
+
+print(worn_plot)
+```
+
+## Export Flat GPS Data
+
+```{r}
+# Rename and select relevant columns for export
+df_final_GPS <- GPS_data %>%
+  select(datetime_minute, Ax_fn1, Ay_fn1, Az_fn1, RSSxyz_fn1, SD_of_RSS, movement, average_movement, worn,
+         Lat_fn1, Lon_fn1, 'Height.m._fn1', 'MSL.m._fn1', "hdop.m._fn1", "vdop.m._fn1")
+
+colnames(df_final_GPS) <- c("TimeStamp", "X__m/s2", "Y__m/s2", "Z__m/s2", "RSSxyz__m/s2", "SD_RSS__m/s2",
+                            "Movement","average_movement", "worn", "original_latitude", "original_longitude",
+                            "Height__m", "MSL__m", "hdop__m", "vdop__m")
+
+# Filter unrealistic GPS values
+df_final_GPS$cleaned_latitude <- ifelse(df_final_GPS$hdop__m > 20 | df_final_GPS$hdop__m < 1, NA, df_final_GPS$original_latitude)
+df_final_GPS$cleaned_longitude <- ifelse(df_final_GPS$hdop__m > 20 | df_final_GPS$hdop__m < 1, NA, df_final_GPS$original_longitude)
+
+# Export to CSV
+exportCSV_filename <- paste0(SN, "_", start_time, "_Flat_GPS_Accelerometer_data_minute_average.csv")
+write.csv(df_final_GPS, exportCSV_filename, row.names = FALSE)
+```
+
+## Load and Format Atmotube Data
+
+```{r}
+# Load Atmotube air quality and environmental data
+Atmotube_data <- read.csv("../inputs/PEM_Household_25-30/E1201005005_MM_19_Feb_2025/GCDC5F8B_EC1201005005_Zerubabel_MM_19_Feb_2025/ATMO7668_EC1201005005_Zerubabel_MM_48hr_19_Feb_2025_18_26_51.csv")
+Atmotube_SN <- '7668'
+
+# Format timestamp and rename columns
+Atmotube_data$Date <- as.POSIXct(Atmotube_data$Date, format = "%Y-%m-%d %H:%M:%S", tz = "Africa/Nairobi")
+Atmotube_data$Date <- with_tz(Atmotube_data$Date, tz = "GMT")
+
+colnames(Atmotube_data)[4] <- "Temperature__C"
+colnames(Atmotube_data)[5] <- "Humidity__percent"
+colnames(Atmotube_data)[6] <- "Pressure__hPa"
+colnames(Atmotube_data)[8] <- "PM25__ugm3"
+
+Atmotube_data <- Atmotube_data[c("Date", "PM25__ugm3", "Temperature__C", "Pressure__hPa", "Humidity__percent")]
+```
+
+
+## Merge Atmotube and GPS Data
+
+```{r}
+# Merge environmental sensor data with motion and location data
+#merged_df <- merge(df_final_GPS, Atmotube_data, by.x = "TimeStamp", by.y = "Date", all.x = TRUE)
+merged_df <- left_join(df_final_GPS, Atmotube_data, by = c("TimeStamp" = "Date"))
+
+
+# Export merged dataset
+exportCSV_filename <- paste0(SN, "_", start_time, "_Flat_Merged_Atmotube_and_GPS_data.csv")
+write.csv(merged_df, exportCSV_filename, row.names = FALSE)
+```
+
+## Atmotube Time Series Plots
+### PM2.5 Concentration
+
+```{r}
+PM25 <- merged_df %>%
+  ggplot(aes(x = TimeStamp, y = PM25__ugm3)) +
+  geom_line(color = 'blue') +
+  ggtitle('PM2.5 concentration') +
+  theme(axis.text = element_text(size = 14))
+saveWidget(ggplotly(PM25), file = paste0(Atmotube_SN, "_PM2.5_concentration.html"))
+
+print(PM25)
+```
+
+### Humidity
+
+```{r}
+RH <- merged_df %>%
+  ggplot(aes(x = TimeStamp, y = Humidity__percent)) +
+  geom_line(color = 'blue') +
+  ggtitle('Humidity (%)') +
+  theme(axis.text = element_text(size = 14))
+saveWidget(ggplotly(RH), file = paste0(Atmotube_SN, "_Humidity.html"))
+
+print(RH)
+```
+
+### Pressure
+
+```{r}
+pressure <- merged_df %>%
+  ggplot(aes(x = TimeStamp, y = Pressure__hPa)) +
+  geom_line(color = 'blue') +
+  ggtitle('Pressure (hPa)') +
+  theme(axis.text = element_text(size = 14))
+saveWidget(ggplotly(pressure), file = paste0(Atmotube_SN, "_Pressure.html"))
+
+print(pressure)
+```
+
+## Mapping GPS Coordinates
+
+This section uses leaflet to map the GPS coordinates. The cleaned_latitude and cleaned_longitude values are plotted on an interactive map. We filter the data for reliable GPS points and generate maps for visualizing movement or worn status based on GPS coordinates.
+
+```{r}
+merged_df <- merged_df %>%
+  filter(hdop__m >= 1, hdop__m <= 20)
+```
+
+### Define Mapping Function
+
+We define a function that generates a map based on the latitude and longitude values.
+
+```{r}
+generate_map_with_legend <- function(data, column, map_title) {
+  if (!all(is.na(data$cleaned_latitude))) {
+    unique_values <- unique(data[[column]])
+
+    if (length(unique_values) == 1) {
+      map <- leaflet(data) %>%
+        addProviderTiles(providers$CartoDB.Positron) %>%
+        addCircles(lng = ~cleaned_longitude, lat = ~cleaned_latitude, color = "green", weight = 4, opacity = 1) %>%
+        addLegend("bottomright", colors = "green", labels = map_title, title = "Legend", opacity = 1)
+    } else if (length(unique_values) == 2) {
+      palette <- colorNumeric(c("#00FF00", "#FF0000"), domain = unique_values)
+      map <- leaflet(data) %>%
+        addProviderTiles(providers$CartoDB.DarkMatter) %>%
+        addCircles(lng = ~original_longitude, lat = ~original_latitude, color = ~palette(data[[column]]), weight = 4, opacity = 1) %>%
+        addLegend("bottomright", values = c(0, 1), colors = c("#00FF00", "#FF0000"), labels = c("Not Worn", "Worn"), title = "Worn", opacity = 1)
+    } else {
+      palette <- colorNumeric("plasma", domain = unique_values)
+      map <- leaflet(data) %>%
+        addProviderTiles(providers$CartoDB.DarkMatter) %>%
+        addCircles(lng = ~cleaned_longitude, lat = ~cleaned_latitude, color = ~palette(data[[column]]), weight = 4, opacity = 1) %>%
+        addLegend("bottomright", pal = palette, values = unique_values, title = map_title, opacity = 1)
+    }
+    return(map)
+  } else {
+    print("NO cleaned coordinate data available for mapping")
+    return(NULL)
+  }
+}
+```
+
+### Render Maps
+
+This section generates maps visualizing GPS coordinates based on movement or worn status.
+
+#### Map Average Movement 
+
+```{r}
+# Average Movement Map
+map1 <- generate_map_with_legend(merged_df, "average_movement", "Average Movement")
+saveWidget(map1, paste0(SN, "_", start_time, "_MAP_Average_Movement.html"))
+
+# Display the map directly
+map1
+```
+
+#### Map Worn 
+
+```{r}
+# Worn
+map2 <- generate_map_with_legend(merged_df, "worn", "Worn")
+saveWidget(map2, paste0(SN, "_", start_time, "_Map_Worn.html"))
+
+map2
+```
+
+#### Map PM2.5 Concentration
+
+```{r}
+# PM2.5
+map3 <- generate_map_with_legend(merged_df, "PM25__ugm3", "PM2.5")
+saveWidget(map3, paste0(SN, "_", start_time, "_MAP_PM25_Atmotube.html"))
+
+map3
+```
+
